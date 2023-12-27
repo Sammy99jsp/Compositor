@@ -10,8 +10,7 @@ authors       = ["Zenails <zenailsc@gmail.com>", "Froxcey <froxcey@avdanos.com>"
 edition       = "2021"
 
 [dependencies]
-
-serde_json    = "1.0.104"
+serde_json = "1.0.104"
 lazy_static   = "1.4.0"
 json_comments = "0.2.1"
 regex         = "1.9.1"
@@ -23,6 +22,9 @@ thiserror     = "1.0.44"
 rand          = "0.8.5"
 xkbcommon     = "0.5.1"
 libc          = "0.2.147"
+tokio         = { version = "1.33.0", features = ["full", "tracing"] }
+chrono = "0.4.31"
+anyhow = "1.0.75"
 
 [dependencies.json-tree]
 
@@ -36,8 +38,7 @@ rev      = "b77ef9a7"
 features = ["desktop", "default", "backend_egl", "use_system_lib"]
 
 [dependencies.serde]
-
-version  = "1.0.178"
+version = "1.0.178"
 features = ["derive"]
 
 [dependencies.slog]

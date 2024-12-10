@@ -2,8 +2,8 @@
 
 name = "av-compositor"
 description = "Wayland compositor made for AvdanOS"
-documentation = "https://docs.avdanos.com/"
-homepage = "https://avdanos.com/"
+documentation = "https://docs.avdanos.org"
+homepage = "https://avdanos.org"
 license = "GPL-3.0"
 version = "0.0.1"
 authors = [
@@ -15,40 +15,3 @@ edition = "2021"
 
 [dependencies]
 
-serde_json    = "1.0.125"
-lazy_static   = "1.5.0"
-json_comments = "0.2.2"
-regex         = "1.10.6"
-slog-term     = "2.9.1"
-bitflags      = "2.6.0"
-colored       = "2.1.0"
-xcursor       = "0.3.8"
-thiserror     = "1.0.63"
-rand          = "0.8.5"
-xkbcommon     = "0.8.0"
-libc          = "0.2.158"
-tokio = { version = "1.33.0", features = ["full", "tracing"] }
-chrono = "0.4.31"
-anyhow = "1.0.75"
-color-eyre = { version = "0.6.3" }
-
-[dependencies.json-tree]
-
-git = "https://github.com/Sammy99jsp/json-tree.git"
-features = ["jsonc"]
-
-[dependencies.smithay]
-
-git = "https://github.com/smithay/smithay.git"
-rev = "b77ef9a7"
-features = ["desktop", "default", "backend_egl", "use_system_lib"]
-
-[dependencies.serde]
-
-version  = "1.0.208"
-features = ["derive"]
-
-[dependencies.slog]
-
-version = "2.7.0"
-features = ["max_level_trace", "release_max_level_warn"]

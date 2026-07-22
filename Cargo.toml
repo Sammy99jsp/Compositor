@@ -1,15 +1,4 @@
-[package]
-
-name = "avdanos-compositor"
-description = "Wayland compositor made for AvdanOS"
-documentation = "https://docs.avdanos.dev/"
-homepage = "https://avdanos.dev/"
-license = "MIT"
-version = "0.0.1"
-authors = [
-    "Sammy <sammy@sammy99jsp.dev>",
-]
-edition = "2024"
-
-[dependencies]
-
+[workspace]
+resolver = "3"
+members = ["crates/compositor"]
+package.edition = "2024"

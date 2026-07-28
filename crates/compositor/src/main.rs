@@ -2,10 +2,20 @@ pub mod backend;
 pub mod colors;
 pub mod config;
 
-use std::{collections::HashSet, os::fd::AsRawFd, sync::Arc};
+use std::{
+    collections::{HashSet, VecDeque},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
+    sync::Arc,
+    task::Poll,
+    time::Duration,
+};
 
+// use skia_safe::prelude::NativeAccess;
+
+use anyhow::Context as _;
 use smithay::reexports::{
     ash::{self, vk},
+    calloop,
     drm::{self, Device, buffer::Buffer, control::Device as _},
     gbm,
 };
@@ -139,37 +149,76 @@ fn main() -> anyhow::Result<()> {
         .map(gbm::Modifier::from)
         .collect::<Vec<_>>();
 
-    let buffers = {
-        let create_scan = || {
-            ScanoutBuffer::new(
-                device.clone(),
-                card.clone(),
-                format,
-                mode,
-                &usable_modifiers,
-            )
-        };
+    // let mut skia = device.clone().skia_context()?;
 
-        [create_scan()?, create_scan()?]
+    let mut output = BufferedOutput::new(
+        card.clone(),
+        device,
+        crtc,
+        plane,
+        mode,
+        connector.handle(),
+        format,
+        &usable_modifiers,
+    )?;
+
+    let mut event_loop = calloop::EventLoop::try_new()?;
+
+    event_loop.handle().insert_source(
+        tty::DrmEventNotifier::new(card.clone()),
+        |event, _, output: &mut BufferedOutput| {
+            if let drm::control::Event::PageFlip(page_flip_event) = event {
+                log::trace!(
+                    "Flip event! {:?} @ {:?}",
+                    page_flip_event.frame,
+                    page_flip_event.duration
+                );
+
+                if let Some(pending_req) = output.queue.pop_front()
+                    && let Err(err) = output.flip(pending_req)
+                {
+                    println!("Error during page flip: {err:?}");
+                }
+            }
+        },
+    )?;
+
+    let signal = event_loop.get_signal();
+
+    event_loop
+        .handle()
+        .insert_source(
+            calloop::timer::Timer::from_duration(Duration::from_secs(10)),
+            move |_, _, _| {
+                signal.stop();
+                calloop::timer::TimeoutAction::Drop
+            },
+        )
+        .map_err(|a| a.error)?;
+
+    let Poll::Ready(req) = output.try_render()? else {
+        panic!("First buffer is still being scanned! Should not be the case!")
     };
+    output.flip(req)?;
 
-    anyhow::ensure!(
-        buffers[0].bo.modifier() == buffers[1].bo.modifier(),
-        "Both buffers should have the same format modifiers!"
-    );
+    let now = std::time::Instant::now();
+    event_loop.run(
+        Some(Duration::from_millis(5)),
+        &mut output,
+        |output| match output.try_render().expect("No error within render loop") {
+            Poll::Ready(req) => output.queue.push_back(req),
+            Poll::Pending => (),
+        },
+    )?;
 
-    let mut output =
-        BufferedOutput::new(card, device, crtc, plane, mode, connector.handle(), buffers)?;
+    let fps = output.frame as f64 / now.elapsed().as_secs_f64();
+    println!("Average FPS: {fps:.3}");
 
-    let start = std::time::Instant::now();
-    loop {
-        if start.elapsed() > std::time::Duration::from_secs(14) {
-            break;
-        }
-
-        output.render_and_flip()?;
-    }
     Ok(())
+}
+
+pub struct ScanoutRequest {
+    pub frame_i: usize,
 }
 
 pub struct BufferedOutput {
@@ -184,15 +233,11 @@ pub struct BufferedOutput {
     previous_state: drm::control::crtc::Info,
 
     // Vulkan
-    device: Arc<tty::vulkan::Device>,
-    render_semaphore: tty::vulkan::ExportableSemaphore,
-    render_fence: vk::Fence,
-    command_buffer: vk::CommandBuffer,
-    command_pool: vk::CommandPool,
-
-    front: usize,
     frame: usize,
-    buffers: [ScanoutBuffer; 2],
+    buffers: [ScanoutBuffer; 3],
+    pool: tty::vulkan::CommandPool,
+    device: Arc<tty::vulkan::Device>,
+    queue: VecDeque<ScanoutRequest>,
 }
 
 impl Drop for BufferedOutput {
@@ -211,10 +256,6 @@ impl Drop for BufferedOutput {
 
         unsafe {
             let _ = self.device.device_wait_idle();
-            self.device.destroy_fence(self.render_fence, None);
-            self.device
-                .free_command_buffers(self.command_pool, &[self.command_buffer]);
-            self.device.destroy_command_pool(self.command_pool, None);
         }
     }
 }
@@ -227,11 +268,11 @@ impl BufferedOutput {
         plane: drm::control::plane::Handle,
         mode: drm::control::Mode,
         connector: drm::control::connector::Handle,
-        buffers: [ScanoutBuffer; 2],
+        format: tty::utils::Format,
+        modifiers: &[gbm::Modifier],
     ) -> anyhow::Result<Self> {
         // Render =:render_sem:=> Scanout
         // Create a Vulkan semaphore that we can export to DRM via a SYNC_FD.
-        let render_semaphore = tty::vulkan::ExportableSemaphore::new(device.clone())?;
 
         let command_pool = {
             let info = vk::CommandPoolCreateInfo::default()
@@ -245,20 +286,57 @@ impl BufferedOutput {
             }
         };
 
-        let cmd = {
+        let (cmd, cmd_frames) = {
             let info = vk::CommandBufferAllocateInfo::default()
                 .command_buffer_count(1)
                 .command_pool(*command_pool)
                 .level(vk::CommandBufferLevel::PRIMARY);
 
-            unsafe {
+            let cmd = unsafe {
                 let [cmd] = device.allocate_command_buffers(&info)?.try_into().unwrap();
 
                 Guard::new(cmd, |cmd| {
                     device.free_command_buffers(*command_pool, &[cmd])
                 })
-            }
+            };
+
+            let info = vk::CommandBufferAllocateInfo::default()
+                .command_buffer_count(3)
+                .command_pool(*command_pool)
+                .level(vk::CommandBufferLevel::PRIMARY);
+
+            let cmd_frames = unsafe {
+                let cmds @ [_, _, _] = device.allocate_command_buffers(&info)?.try_into().unwrap();
+
+                Guard::new(cmds, |cmds| {
+                    device.free_command_buffers(*command_pool, cmds.as_slice())
+                })
+            };
+
+            (cmd, cmd_frames)
         };
+
+        let buffers = {
+            let [cmd1, cmd2, cmd3] = cmd_frames.finish();
+            let create_scan = |cmd| {
+                ScanoutBuffer::new(
+                    device.clone(),
+                    card.clone(),
+                    format,
+                    mode,
+                    modifiers,
+                    *command_pool,
+                    cmd, // &mut skia,
+                )
+            };
+
+            [create_scan(cmd1)?, create_scan(cmd2)?, create_scan(cmd3)?]
+        };
+
+        anyhow::ensure!(
+            buffers[0].bo.modifier() == buffers[1].bo.modifier(),
+            "Both buffers should have the same format modifiers!"
+        );
 
         // Clear the first buffer to avoid displaying garbage.
         {
@@ -290,7 +368,7 @@ impl BufferedOutput {
                 .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::GENERAL)
-                .image(buffers[0].image)
+                .image(buffers[2].image)
                 .subresource_range(
                     vk::ImageSubresourceRange::default()
                         .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -307,17 +385,17 @@ impl BufferedOutput {
                 )
             };
 
-            // Fill with RED.
+            // Fill with BLACK.
             {
                 let attachment = vk::RenderingAttachmentInfo::default()
                     .image_layout(vk::ImageLayout::GENERAL)
-                    .image_view(buffers[0].image_view)
+                    .image_view(buffers[2].image_view)
                     // RED
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::STORE)
                     .clear_value(vk::ClearValue {
                         color: vk::ClearColorValue {
-                            float32: [1.0, 0.0, 0.0, 1.0],
+                            float32: [0.0, 0.0, 0.0, 1.0],
                         },
                     });
 
@@ -350,18 +428,12 @@ impl BufferedOutput {
             };
         }
 
-        let render_fence = unsafe {
-            device.create_fence(
-                &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
-                None,
-            )?
-        };
-
         let previous_state = card.get_crtc(crtc)?;
+
+        drop(cmd);
 
         let mut output = Self {
             cache: tty::atomic_req::AtomicRequestCache::new(card.clone()),
-            front: 0,
             frame: 0,
             connector,
             crtc,
@@ -369,12 +441,10 @@ impl BufferedOutput {
             mode,
             previous_state,
             buffers,
-            command_buffer: cmd.finish(),
-            command_pool: command_pool.finish(),
-            render_semaphore,
-            render_fence,
             card,
+            pool: tty::vulkan::CommandPool::new(device.clone(), command_pool.finish()),
             device,
+            queue: VecDeque::with_capacity(3),
         };
 
         output.modeset()?;
@@ -385,7 +455,7 @@ impl BufferedOutput {
     pub fn modeset(&mut self) -> anyhow::Result<()> {
         use tty::atomic_req::*;
 
-        let fb = self.buffers[self.front].fb;
+        let fb = self.buffers[self.frame].fb;
         let (w, h) = self.mode.size();
 
         // This blocks to prevent a race condition with the cleanup of the `MODE_ID` blob.
@@ -410,25 +480,36 @@ impl BufferedOutput {
         Ok(())
     }
 
-    fn render_and_flip(&mut self) -> anyhow::Result<()> {
-        let back = 1 - self.front;
-        self.frame = (self.frame + 1) % COLORS.len();
-        let color = COLORS[self.frame];
+    fn try_render(&mut self) -> anyhow::Result<Poll<ScanoutRequest>> {
+        let (frame_i, buffer, color) = {
+            let frame_i = self.frame % 3;
+            let color = COLORS[self.frame % COLORS.len()];
+            (frame_i, &mut self.buffers[frame_i], color)
+        };
+
+        let fence_signal = unsafe {
+            self.device.get_fence_status(*buffer.fence)?
+                && self.device.get_fence_status(buffer.cmd_fence)?
+        };
+
+        if !fence_signal {
+            return Ok(Poll::Pending);
+        }
+
+        log::trace!("Frame #{} in buffer #{}", self.frame, frame_i);
+        self.frame += 1;
 
         unsafe {
             self.device
-                .wait_for_fences(&[self.render_fence], true, u64::MAX)?;
-            self.device.reset_fences(&[self.render_fence])?;
-            self.device.reset_command_buffer(
-                self.command_buffer,
-                vk::CommandBufferResetFlags::default(),
-            )?;
+                .reset_fences(&[*buffer.fence, buffer.cmd_fence])?;
+            self.device
+                .reset_command_buffer(buffer.cmd, vk::CommandBufferResetFlags::default())?;
         }
 
         {
             unsafe {
                 self.device.begin_command_buffer(
-                    self.command_buffer,
+                    buffer.cmd,
                     &vk::CommandBufferBeginInfo::default()
                         .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT),
                 )?
@@ -440,7 +521,7 @@ impl BufferedOutput {
                 .dst_access_mask(vk::AccessFlags2::COLOR_ATTACHMENT_WRITE)
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::GENERAL)
-                .image(self.buffers[back].image)
+                .image(buffer.image)
                 .subresource_range(
                     vk::ImageSubresourceRange::default()
                         .aspect_mask(vk::ImageAspectFlags::COLOR)
@@ -451,7 +532,7 @@ impl BufferedOutput {
             // UNDEFINED -> GENERAL layout
             unsafe {
                 self.device.cmd_pipeline_barrier2(
-                    self.command_buffer,
+                    buffer.cmd,
                     &vk::DependencyInfo::default()
                         .image_memory_barriers(core::slice::from_ref(&barrier)),
                 )
@@ -461,7 +542,7 @@ impl BufferedOutput {
             {
                 let attachment = vk::RenderingAttachmentInfo::default()
                     .image_layout(vk::ImageLayout::GENERAL)
-                    .image_view(self.buffers[back].image_view)
+                    .image_view(buffer.image_view)
                     // RED
                     .load_op(vk::AttachmentLoadOp::CLEAR)
                     .store_op(vk::AttachmentStoreOp::STORE)
@@ -482,56 +563,101 @@ impl BufferedOutput {
                     .color_attachments(core::slice::from_ref(&attachment));
 
                 unsafe {
-                    self.device
-                        .cmd_begin_rendering(self.command_buffer, &render);
+                    self.device.cmd_begin_rendering(buffer.cmd, &render);
                 }
-                unsafe { self.device.cmd_end_rendering(self.command_buffer) };
+                unsafe { self.device.cmd_end_rendering(buffer.cmd) };
             }
 
-            unsafe { self.device.end_command_buffer(self.command_buffer)? }
+            unsafe { self.device.end_command_buffer(buffer.cmd)? }
         }
 
         unsafe {
             self.device.queue_submit(
                 self.device.queue,
                 &[vk::SubmitInfo::default()
-                    .command_buffers(&[self.command_buffer])
-                    .signal_semaphores(self.render_semaphore.as_slice())],
-                self.render_fence,
+                    .command_buffers(&[buffer.cmd])
+                    .signal_semaphores(buffer.semaphore.as_slice())],
+                buffer.cmd_fence,
             )?;
         }
 
-        {
-            use tty::atomic_req::*;
-            let sync_fd = self.render_semaphore.sync_fd()?;
+        // let surface = &mut self.buffers[back].surface;
+        // let canvas = surface.canvas();
+        // let paint = skia_safe::Paint::new(skia_safe::Color4f::from(skia_safe::Color::BLACK), None);
+        // canvas
+        //     .clear(skia_safe::Color::WHITE) //
+        //     .draw_text_align(
+        //         self.frame.to_string(),
+        //         ( 0.0, 100.0),
+        //         &skia_safe::Font::default(),
+        //         &paint,
+        //         skia_safe::utils::text_utils::Align::Left,
+        //     );
 
-            self.cache
-                .request()
-                .set(self.plane, FB_ID, Some(self.buffers[back].fb))?
-                .set(self.plane, IN_FENCE_FD, sync_fd)?
-                .commit(AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK)?;
+        // {
+        //     let semaphores = self.render_semaphore.skia();
+        //     let flush_info = {
+        //         let mut info = skia_safe::gpu::FlushInfo::default();
+        //         unsafe { info.set_signal_semaphores(semaphores) };
+        //         info
+        //     };
+
+        //     let mut ctx = surface.direct_context().unwrap();
+        //     let submitted_semaphores = ctx.flush_surface_with_access(
+        //         surface,
+        //         skia_safe::surface::BackendSurfaceAccess::NoAccess,
+        //         &flush_info,
+        //     );
+        //     assert_eq!(
+        //         submitted_semaphores,
+        //         skia_safe::gpu::ganesh::SemaphoresSubmitted::Yes
+        //     );
+
+        //     let can_wait_on_semaphore = ctx.submit(Some(skia_safe::gpu::SyncCpu::No));
+        //     assert!(can_wait_on_semaphore);
+        // }
+
+        Ok(Poll::Ready(ScanoutRequest { frame_i }))
+    }
+
+    fn flip(&mut self, req: ScanoutRequest) -> anyhow::Result<()> {
+        use tty::atomic_req::*;
+
+        let ScanoutRequest { frame_i } = req;
+        let buffer = &mut self.buffers[frame_i];
+        let mut out_fd: RawFd = -1;
+
+        self.cache
+            .request()
+            .set(self.plane, FB_ID, Some(buffer.fb))?
+            .set(self.plane, IN_FENCE_FD, buffer.semaphore.sync_fd()?)?
+            .set(self.crtc, OUT_FENCE_PTR, &raw mut out_fd)?
+            .commit(AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK)
+            .context(format!("Submitting page flip for page #{}", self.frame))?;
+
+        if out_fd == -1 {
+            panic!("OUT_FENCE_PTR is invalid!");
         }
 
-        self.wait_for_flip()?;
-
-        self.front = back;
+        let out_fd = unsafe { OwnedFd::from_raw_fd(out_fd) };
+        buffer.fence.import(out_fd)?;
 
         Ok(())
     }
 
-    fn wait_for_flip(&self) -> std::io::Result<()> {
-        loop {
-            let mut events = match self.card.receive_events() {
-                Ok(events) => events,
-                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(err) => return Err(err),
-            };
+    // fn wait_for_flip(&self) -> std::io::Result<()> {
+    //     loop {
+    //         let mut events = match self.card.receive_events() {
+    //             Ok(events) => events,
+    //             Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+    //             Err(err) => return Err(err),
+    //         };
 
-            if events.any(|ev| matches!(ev, drm::control::Event::PageFlip(_))) {
-                return Ok(());
-            }
-        }
-    }
+    //         if events.any(|ev| matches!(ev, drm::control::Event::PageFlip(_))) {
+    //             return Ok(());
+    //         }
+    //     }
+    // }
 }
 
 pub struct ScanoutBuffer {
@@ -542,12 +668,19 @@ pub struct ScanoutBuffer {
     image_view: vk::ImageView,
     fb: drm::control::framebuffer::Handle,
     bo: gbm::BufferObject<()>,
+    fence: tty::vulkan::ImportableFence,
+    semaphore: tty::vulkan::ExportableSemaphore,
+    pool: vk::CommandPool,
+    cmd: vk::CommandBuffer, // surface: skia_safe::Surface,
+    cmd_fence: vk::Fence,
 }
 
 impl Drop for ScanoutBuffer {
     fn drop(&mut self) {
         let _ = self.card.destroy_framebuffer(self.fb);
         unsafe {
+            self.device.destroy_fence(self.cmd_fence, None);
+            self.device.free_command_buffers(self.pool, &[self.cmd]);
             self.device.destroy_image_view(self.image_view, None);
             self.device.destroy_image(self.image, None);
             self.device.free_memory(self.memory, None);
@@ -562,9 +695,16 @@ impl ScanoutBuffer {
         format: tty::utils::Format,
         mode: drm::control::Mode,
         usable_modifiers: &[gbm::Modifier],
+        pool: vk::CommandPool,
+        cmd: vk::CommandBuffer, // skia_context: &mut skia_safe::gpu::DirectContext,
     ) -> anyhow::Result<ScanoutBuffer> {
         // Create a BufferObject with
         let (width, height) = mode.size();
+
+        let cmd = Guard::new(cmd, |cmd| {
+            unsafe { device.free_command_buffers(pool, &[cmd]) };
+        });
+
         let bo = card.create_buffer_object_with_modifiers2::<()>(
             width as _,
             height as _,
@@ -693,14 +833,60 @@ impl ScanoutBuffer {
 
         let framebuffer = card.add_planar_framebuffer(&bo, drm::control::FbCmd2Flags::MODIFIERS)?;
 
+        let cmd_fence = unsafe {
+            Guard::new(
+                device.create_fence(
+                    &vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED),
+                    None,
+                )?,
+                |fence| device.destroy_fence(fence, None),
+            )
+        };
+        // let surface = {
+        //     let image_info = unsafe {
+        //         skia_safe::gpu::vk::ImageInfo::new(
+        //             image.as_raw() as _,
+        //             Default::default(),
+        //             skia_safe::gpu::vk::ImageTiling::DRM_FORMAT_MODIFIER_EXT,
+        //             skia_safe::gpu::vk::ImageLayout::UNDEFINED,
+        //             std::mem::transmute::<vk::Format, skia_safe::gpu::vk::Format>(format.vk()),
+        //             1,
+        //             device.queue_family,
+        //             None,
+        //             None,
+        //             None,
+        //         )
+        //     };
+
+        //     let render_target = skia_safe::gpu::backend_render_targets::make_vk(
+        //         (width as i32, height as i32),
+        //         &image_info,
+        //     );
+
+        //     skia_safe::gpu::surfaces::wrap_backend_render_target(
+        //         skia_context,
+        //         &render_target,
+        //         skia_safe::gpu::SurfaceOrigin::TopLeft,
+        //         format.skia(),
+        //         None,
+        //         None,
+        //     )
+        //     .context("wrap surface")?
+        // };
+
         Ok(ScanoutBuffer {
+            fence: tty::vulkan::ImportableFence::new(device.clone())?,
+            semaphore: tty::vulkan::ExportableSemaphore::new(device.clone())?,
             memory: memory.finish(),
             image: image.finish(),
             image_view: image_view.finish(),
             fb: framebuffer,
             bo,
-            device,
             card,
+            pool,
+            cmd: cmd.finish(),
+            cmd_fence: cmd_fence.finish(),
+            device,
         })
     }
 }

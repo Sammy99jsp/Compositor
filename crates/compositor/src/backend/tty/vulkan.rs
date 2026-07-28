@@ -1,6 +1,6 @@
-use std::{collections::HashSet, ffi::CStr, ops::Deref, os::fd::{FromRawFd, OwnedFd}, sync::Arc};
+use std::{collections::HashSet, ffi::CStr, ops::Deref, os::fd::{AsRawFd, FromRawFd, OwnedFd}, sync::Arc};
 
-use smithay::reexports::{ash::{self, vk}, };
+use smithay::reexports::ash::{self, vk::{self, Handle}};
 
 #[cfg(debug_assertions)]
 const REQUIRED_INSTANCE_EXTENSIONS: &[&CStr] = &[ash::ext::debug_utils::NAME];
@@ -63,8 +63,7 @@ pub struct Instance {
     instance: RawInstance,
 
     // We're putting this in here for this to be dropped last.
-    #[expect(unused)]
-    entry: ash::Entry,
+    pub entry: ash::Entry,
 }
 
 impl Deref for Instance {
@@ -326,13 +325,19 @@ impl Instance {
             &device
         );
 
+        let external_fence_api = ash::khr::external_fence_fd::Device::new(
+            &instance, 
+            &device
+        );
+
         Ok(Device {
             device: RawDevice(device),
             physical: physical_device,
             queue,
             queue_family: graphics_family_idx as u32,
             instance,
-            external_semaphore_api
+            external_semaphore_api,
+            external_fence_api
         })
     }
 }
@@ -346,6 +351,7 @@ pub struct Device {
     pub instance: Instance,
 
     pub external_semaphore_api: ash::khr::external_semaphore_fd::Device,
+    pub external_fence_api: ash::khr::external_fence_fd::Device,
 }
 
 pub struct RawDevice(ash::Device);
@@ -370,6 +376,7 @@ impl Deref for Device {
 pub struct ExportableSemaphore {
     device: Arc<Device>, 
     semaphore: vk::Semaphore,
+    skia: skia_safe::gpu::ganesh::BackendSemaphore,
 }
 
 impl Drop for ExportableSemaphore {
@@ -378,6 +385,14 @@ impl Drop for ExportableSemaphore {
         unsafe { 
             self.device.destroy_semaphore(self.semaphore, None);
         }
+    }
+}
+
+impl Deref for ExportableSemaphore {
+    type Target = vk::Semaphore;
+
+    fn deref(&self) -> &Self::Target {
+        &self.semaphore
     }
 }
 
@@ -391,9 +406,14 @@ impl ExportableSemaphore {
             (unsafe { device.create_semaphore(&info, None) })?
         };
 
-       
+        // SAFETY: This semaphore will outlive the GrBackendSemaphore.
+        let skia = unsafe { skia_safe::gpu::ganesh::vk::backend_semaphores::make_vk(semaphore.as_raw() as *mut _) };
 
-        Ok(Self { semaphore, device })
+        Ok(Self { semaphore, device, skia })
+    }
+
+    pub fn skia(&mut self) -> &mut [skia_safe::gpu::ganesh::BackendSemaphore] {
+        core::slice::from_mut(&mut self.skia)
     }
 
     pub fn as_slice(&self) -> &[vk::Semaphore] {
@@ -424,6 +444,81 @@ impl ExportableSemaphore {
             //         and we have checked that this is indeed a valid file descriptor.
             Ok(Some(OwnedFd::from_raw_fd(sync_fd)))
         }
+    }
+}
+
+pub struct ImportableFence {
+    device: Arc<Device>,
+    fence: vk::Fence
+}
+
+impl Drop for ImportableFence {
+    fn drop(&mut self) {
+        unsafe { self.device.destroy_fence(self.fence, None); }
+    }
+}
+
+
+impl Deref for ImportableFence {
+    type Target = vk::Fence;
+
+    fn deref(&self) -> &Self::Target {
+        &self.fence
+    }
+}
+
+
+impl ImportableFence {
+    pub fn new(device: Arc<Device>) -> ash::prelude::VkResult<Self> {
+        let fence = {
+            let info = vk::FenceCreateInfo::default()
+                .flags(vk::FenceCreateFlags::SIGNALED);
+
+            unsafe { device.create_fence(&info, None)? }
+        };
+
+
+        Ok(Self {
+            device,
+            fence,
+        })
+    }
+
+    pub fn import(&mut self, fd: OwnedFd) -> ash::prelude::VkResult<()> {
+            let raw_fd = fd.as_raw_fd();
+            let info = vk::ImportFenceFdInfoKHR::default()
+                .fence(self.fence)
+                .fd(raw_fd)
+                .handle_type(vk::ExternalFenceHandleTypeFlags::SYNC_FD)
+                .flags(vk::FenceImportFlags::TEMPORARY);
+
+            unsafe {
+                // self.device.reset_fences(self.as_slice())?;
+                self.device.external_fence_api.import_fence_fd(&info)?;
+            }
+
+            // Only transfer ownership of the fd to Vulkan if the call is successful.
+            std::mem::forget(fd);
+
+            Ok(())
+    } 
+
+    pub fn as_slice(&self) -> &[vk::Fence] {
+        core::slice::from_ref(&self.fence)
+    }
+}
+
+pub struct CommandPool(Arc<Device>, vk::CommandPool);
+
+impl CommandPool {
+    pub fn new(device: Arc<Device>, command_pool: vk::CommandPool) -> Self {
+        Self(device, command_pool)
+    }
+}
+
+impl Drop for CommandPool {
+    fn drop(&mut self) {
+        unsafe {self.0.destroy_command_pool(self.1, None); }
     }
 }
 

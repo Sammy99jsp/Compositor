@@ -248,6 +248,12 @@ impl AtomicReqType for bool {
     }
 }
 
+impl<T> AtomicReqType for *mut T {
+    fn to_value(&self, _: &Card) -> std::io::Result<property::Value<'static>> {
+        Ok(property::Value::UnsignedRange(self.addr() as u64))
+    }
+}
+
 macro_rules! handle_impl {
     ($($type: path => $var: ident);* $(;)?) => {
         $(
@@ -322,7 +328,7 @@ impl AtomicReqType for Option<OwnedFd> {
 
 #[allow(nonstandard_style)]
 pub mod props {
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{OwnedFd, RawFd};
 
     use crate::backend::tty::atomic_req::ToBlob;
 
@@ -391,7 +397,7 @@ pub mod props {
         /// The Atomic Commit request fails if a invalid pointer is passed. If the Atomic Commit request fails for any other reason the out fence fd returned will be `-1`.
         ///
         /// On a Atomic Commit with the [drm::control::AtomicCommitFlags::TEST_ONLY] flag the out fence will also be set to `-1`.
-        OUT_FENCE_PTR: i32 => drm::control::crtc::Handle;
+        OUT_FENCE_PTR: *mut RawFd => drm::control::crtc::Handle;
 
         /// CRTC that connector is attached to (atomic)
         CRTC_ID: Option<drm::control::crtc::Handle> => drm::control::plane::Handle, drm::control::connector::Handle;

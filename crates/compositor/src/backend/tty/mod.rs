@@ -1,13 +1,17 @@
+pub mod atomic_req;
 pub mod format_modifier;
+pub mod skia;
 pub mod utils;
 pub mod vulkan;
-pub mod atomic_req;
 
-use std::os::fd::AsFd;
+use std::{ops::Deref, os::fd::AsFd, sync::Arc};
 
 use smithay::{
     backend::drm::DrmNode,
-    reexports::drm::{self, Device, control::Device as _},
+    reexports::{
+        calloop,
+        drm::{self, Device, control::Device as _},
+    },
 };
 
 #[derive(Debug)]
@@ -102,5 +106,80 @@ impl Card {
         };
 
         Ok(cards.swap_remove(i))
+    }
+}
+
+pub struct DrmEventNotifier<R> {
+    token: Option<calloop::Token>,
+    card: Arc<R>,
+}
+
+impl<R: Deref<Target = Card>> DrmEventNotifier<R> {
+    pub fn new(card: Arc<R>) -> Self {
+        Self { token: None, card }
+    }
+}
+
+impl<R: Deref<Target = Card>> calloop::EventSource for DrmEventNotifier<R> {
+    type Event = drm::control::Event;
+    type Metadata = ();
+    type Ret = ();
+    type Error = std::io::Error;
+
+    fn process_events<F>(
+        &mut self,
+        _: calloop::Readiness,
+        token: calloop::Token,
+        mut callback: F,
+    ) -> Result<calloop::PostAction, Self::Error>
+    where
+        F: FnMut(Self::Event, &mut Self::Metadata) -> Self::Ret,
+    {
+        if Some(token) != self.token {
+            return Ok(calloop::PostAction::Continue);
+        }
+
+        log::trace!("Pooling for DRM events...");
+        let events = self.card.receive_events()?;
+        events.for_each(|event| callback(event, &mut ()));
+
+        Ok(calloop::PostAction::Continue)
+    }
+
+    fn register(
+        &mut self,
+        poll: &mut calloop::Poll,
+        factory: &mut calloop::TokenFactory,
+    ) -> calloop::Result<()> {
+        self.token = Some(factory.token());
+
+        // Safety: the FD cannot be closed without removing the DrmDeviceNotifier from the event loop
+        unsafe {
+            poll.register(
+                self.card.as_fd(),
+                calloop::Interest::READ,
+                calloop::Mode::Level,
+                self.token.unwrap(),
+            )
+        }
+    }
+
+    fn reregister(
+        &mut self,
+        poll: &mut calloop::Poll,
+        factory: &mut calloop::TokenFactory,
+    ) -> calloop::Result<()> {
+        self.token = Some(factory.token());
+        poll.reregister(
+            self.card.as_fd(),
+            calloop::Interest::READ,
+            calloop::Mode::Level,
+            self.token.unwrap(),
+        )
+    }
+
+    fn unregister(&mut self, poll: &mut calloop::Poll) -> calloop::Result<()> {
+        self.token = None;
+        poll.unregister(self.card.as_fd())
     }
 }

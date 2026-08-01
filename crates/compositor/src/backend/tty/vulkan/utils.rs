@@ -86,11 +86,13 @@ impl Drop for RawInstance {
     }
 }
 
+#[cfg(debug_assertions)]
 struct DebugUtils {
     instance: ash::ext::debug_utils::Instance,
     messenger: ash::vk::DebugUtilsMessengerEXT,
 }
 
+#[cfg(debug_assertions)]
 impl Drop for DebugUtils {
     fn drop(&mut self) {
         unsafe {

@@ -6,16 +6,19 @@ use std::{sync::Arc, task::Poll, time::Duration};
 
 // use skia_safe::prelude::NativeAccess;
 
-use smithay::reexports::{
-    calloop,
-    drm::{self, Device, control::Device as _},
-    gbm,
+use smithay::{
+    reexports::{
+        calloop,
+        drm::{self, Device, control::Device as _},
+        gbm,
+    },
+    utils::DevPath,
 };
 
 use crate::backend::tty::{
     self, BufferedOutput,
+    cpu::Cpu,
     drmx::{self, DrmEventNotifier},
-    vulkan::Vulkan,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -27,6 +30,8 @@ fn main() -> anyhow::Result<()> {
     let resources = card.resource_handles()?;
 
     let card = Arc::new(gbm::Device::new(card)?);
+
+    log::trace!("Using card {:?}", card.dev_path());
 
     // Pick a suitable CRTC and mode for the active connector.
     let connector = resources
@@ -114,12 +119,12 @@ fn main() -> anyhow::Result<()> {
     // let mut skia = device.clone().skia_context()?;
 
     let mut output =
-        BufferedOutput::<Vulkan>::new(card.clone(), crtc, plane, mode, connector.handle(), format)?;
+        BufferedOutput::new(card.clone(), crtc, plane, mode, connector.handle(), format)?;
     let mut event_loop = calloop::EventLoop::try_new()?;
 
     event_loop.handle().insert_source(
         DrmEventNotifier::new(card.clone()),
-        |event, _, output: &mut BufferedOutput<Vulkan>| {
+        |event, _, output: &mut BufferedOutput<Cpu>| {
             if let drm::control::Event::PageFlip(page_flip_event) = event {
                 log::trace!(
                     "Flip event! {:?} @ {:?}",
@@ -128,7 +133,7 @@ fn main() -> anyhow::Result<()> {
                 );
 
                 if let Err(err) = output.flip() {
-                    println!("Error during page flip: {err:?}");
+                    log::error!("Error during page flip: {err:?}");
                 }
             }
         },
@@ -151,10 +156,12 @@ fn main() -> anyhow::Result<()> {
         panic!("First buffer is still being scanned! Should not be the case!")
     };
 
+    log::trace!("Before Flip page!");
     let Poll::Ready(()) = output.flip()? else {
         panic!("Should not have a problem with queuing an initial flip.")
     };
-
+    
+    log::trace!("After Flip page!");
     let now = std::time::Instant::now();
     event_loop.run(
         Some(Duration::from_millis(5)),

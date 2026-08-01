@@ -12,6 +12,7 @@ use smithay::reexports::{
 
 use crate::backend::tty::utils::Guard;
 
+pub mod cpu;
 pub mod drmx;
 pub mod utils;
 pub mod vulkan;
@@ -19,19 +20,23 @@ pub mod vulkan;
 pub type Card = gbm::Device<drmx::Card>;
 
 pub trait Backend {
+    const NAME: &str;
+    const BUFFER_FLAGS: gbm::BufferObjectFlags =
+        const { gbm::BufferObjectFlags::SCANOUT.union(gbm::BufferObjectFlags::RENDERING) };
+
     type Error: std::error::Error;
 
-    fn new(card: &Card) -> Result<Self, Self::Error>
+    fn new(card: &Arc<Card>) -> Result<Self, Self::Error>
     where
         Self: Sized;
 
-    fn modifiers(&self, format: drmx::Format) -> HashSet<u64>;
+    fn modifiers(&self, format: drmx::Format, drm_modifiers: &HashSet<u64>) -> HashSet<u64>;
 
     type Buffer: BackendBuffer<Backend = Self>;
     fn new_buffer(
         &self,
         drm: &DrmState,
-        bo: &gbm::BufferObject<()>,
+        bo: gbm::BufferObject<()>,
     ) -> Result<Self::Buffer, Self::Error>;
 
     fn render(&mut self, buffer: &mut Self::Buffer, frame: usize) -> Result<Poll<()>, Self::Error>;
@@ -41,10 +46,17 @@ pub trait BackendBuffer {
     type Backend: Backend;
 
     /// Import a sync file from DRM, which signals when scanout completes (and the backend can re-use this buffer).
-    fn import_sync(&mut self, fd: OwnedFd) -> Result<(), <Self::Backend as Backend>::Error>;
+    fn import_sync(
+        &mut self,
+        backend: &mut Self::Backend,
+        fd: OwnedFd,
+    ) -> Result<(), <Self::Backend as Backend>::Error>;
 
     /// Export a sync file for DRM, which is signalled when the rendering completes (and DRM can scanout from this buffer)
-    fn export_sync(&mut self) -> Result<Option<OwnedFd>, <Self::Backend as Backend>::Error>;
+    fn export_sync(
+        &mut self,
+        backend: &mut Self::Backend,
+    ) -> Result<Option<OwnedFd>, <Self::Backend as Backend>::Error>;
 }
 
 const LEN: usize = 3;
@@ -116,25 +128,15 @@ impl<B: Backend> BufferedOutput<B> {
                 drm_modifiers::<B>(&card, format.fourcc(), &card.get_properties(plane)?)?;
 
             // Provided by backend...
-            let vulkan_modifiers = backend.modifiers(format);
+            let backend_modifiers = backend.modifiers(format, &drm_modifiers);
 
             // Intersect the DRM- and Vulkan-provided format modifiers
-            let usable_modifiers = vulkan_modifiers
+
+            backend_modifiers
                 .intersection(&drm_modifiers)
                 .copied()
-                .collect::<Vec<_>>();
-
-            if usable_modifiers.is_empty() {
-                log::warn!(
-                    "no common modifier between DRM plane and Vulkan; falling back to linear"
-                );
-                vec![u64::from(gbm::Modifier::Linear)]
-            } else {
-                usable_modifiers
-            }
-            .into_iter()
-            .map(gbm::Modifier::from)
-            .collect::<Vec<_>>()
+                .map(gbm::Modifier::from)
+                .collect::<Vec<_>>()
         };
 
         let drm = DrmState {
@@ -198,7 +200,9 @@ impl<B: Backend> BufferedOutput<B> {
         let frame_i = self.frame % 3;
         let buffer = &mut self.buffers[frame_i];
 
+        log::trace!("Backend render start.");
         let poll = self.backend.render(&mut buffer.backend, self.frame)?;
+        log::trace!("Backend render end.");
         if let Poll::Ready(()) = poll {
             self.frame += 1;
             self.queue.push_back(ScanoutRequest { frame_i });
@@ -218,6 +222,7 @@ impl<B: Backend> BufferedOutput<B> {
         let drm = &mut self.drm;
         let mut out_fd: RawFd = -1;
 
+        log::trace!("Modesetting request!");
         drm.cache
             .request()
             .set(drm.plane, FB_ID, Some(buffer.framebuffer))
@@ -227,7 +232,7 @@ impl<B: Backend> BufferedOutput<B> {
                 IN_FENCE_FD,
                 buffer
                     .backend
-                    .export_sync()
+                    .export_sync(&mut self.backend)
                     .map_err(ScanoutError::Backend)?,
             )
             .map_err(ModesetError::from)?
@@ -240,9 +245,10 @@ impl<B: Backend> BufferedOutput<B> {
         }
 
         let out_fd = unsafe { OwnedFd::from_raw_fd(out_fd) };
+        log::trace!("Backend import syncfile");
         buffer
             .backend
-            .import_sync(out_fd)
+            .import_sync(&mut self.backend, out_fd)
             .map_err(ScanoutError::Backend)?;
 
         Ok(Poll::Ready(()))
@@ -283,9 +289,6 @@ pub struct ScanoutBuffer<B: Backend> {
     card: Arc<Card>,
     framebuffer: drm::control::framebuffer::Handle,
 
-    #[allow(unused)] // Here for lifetime purpose...
-    buffer_object: gbm::BufferObject<()>,
-
     pub backend: B::Buffer,
 }
 
@@ -299,14 +302,32 @@ impl<B: Backend> ScanoutBuffer<B> {
     pub fn new(drm: &DrmState, backend: &B) -> Result<Self, ScanoutError<B>> {
         let (width, height) = drm.mode.size();
 
-        let buffer_object = drm.card.create_buffer_object_with_modifiers2::<()>(
-            width as _,
-            height as _,
-            drm.format.fourcc(),
-            drm.modifiers.iter().copied(),
-            gbm::BufferObjectFlags::SCANOUT | gbm::BufferObjectFlags::RENDERING,
-        )?;
+        log::trace!("Making buffer object");
 
+        let buffer_object: gbm::BufferObject<()> = if drm.modifiers.is_empty() {
+            // Linear Fallback.
+            log::warn!(
+                "no common modifier between DRM plane and {}; falling back to linear",
+                B::NAME
+            );
+
+            drm.card.create_buffer_object(
+                width as _,
+                height as _,
+                drm.format.fourcc(),
+                B::BUFFER_FLAGS,
+            )?
+        } else {
+            drm.card.create_buffer_object_with_modifiers2::<()>(
+                width as _,
+                height as _,
+                drm.format.fourcc(),
+                drm.modifiers.iter().copied(),
+                B::BUFFER_FLAGS,
+            )?
+        };
+
+        log::trace!("Making framebuffer");
         let framebuffer = Guard::new(
             drm.card
                 .add_planar_framebuffer(&buffer_object, drm::control::FbCmd2Flags::MODIFIERS)?,
@@ -317,10 +338,10 @@ impl<B: Backend> ScanoutBuffer<B> {
 
         Ok(Self {
             backend: backend
-                .new_buffer(drm, &buffer_object)
+                .new_buffer(drm, buffer_object)
                 .map_err(ScanoutError::Backend)?,
             framebuffer: framebuffer.finish(),
-            buffer_object,
+
             card: drm.card.clone(),
         })
     }

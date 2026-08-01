@@ -48,6 +48,9 @@ pub struct VulkanBuffer {
     cmd: vk::CommandBuffer,
     cmd_fence: vk::Fence,
     size: (u32, u32),
+
+    #[expect(unused)]
+    bo: gbm::BufferObject<()>,
 }
 
 #[derive(Debug, Error)]
@@ -78,9 +81,10 @@ impl From<String> for VulkanError {
 }
 
 impl Backend for Vulkan {
+    const NAME: &str = "Vulkan";
     type Error = VulkanError;
 
-    fn new(card: &Card) -> Result<Self, Self::Error> {
+    fn new(card: &Arc<Card>) -> Result<Self, Self::Error> {
         let instance = Instance::load()?;
         let device = Arc::new(instance.device_for(card)?);
 
@@ -90,7 +94,7 @@ impl Backend for Vulkan {
         })
     }
 
-    fn modifiers(&self, format: drmx::Format) -> HashSet<u64> {
+    fn modifiers(&self, format: drmx::Format, _: &HashSet<u64>) -> HashSet<u64> {
         let device = &self.device;
 
         // Get the number of available format modifiers.
@@ -139,7 +143,7 @@ impl Backend for Vulkan {
     fn new_buffer(
         &self,
         drm: &DrmState,
-        bo: &gbm::BufferObject<()>,
+        bo: gbm::BufferObject<()>,
     ) -> Result<Self::Buffer, Self::Error> {
         let cmd = {
             let [cmd] = unsafe {
@@ -305,6 +309,7 @@ impl Backend for Vulkan {
                 let (w, h) = drm.mode.size();
                 (w as u32, h as u32)
             },
+            bo,
         })
     }
 
@@ -424,12 +429,19 @@ impl Drop for VulkanBuffer {
 impl BackendBuffer for VulkanBuffer {
     type Backend = Vulkan;
 
-    fn import_sync(&mut self, fd: OwnedFd) -> Result<(), <Self::Backend as Backend>::Error> {
+    fn import_sync(
+        &mut self,
+        _: &mut Vulkan,
+        fd: OwnedFd,
+    ) -> Result<(), <Self::Backend as Backend>::Error> {
         self.fence.import(fd)?;
         Ok(())
     }
 
-    fn export_sync(&mut self) -> Result<Option<OwnedFd>, <Self::Backend as Backend>::Error> {
+    fn export_sync(
+        &mut self,
+        _: &mut Vulkan,
+    ) -> Result<Option<OwnedFd>, <Self::Backend as Backend>::Error> {
         self.semaphore.sync_fd().map_err(VulkanError::Vulkan)
     }
 }

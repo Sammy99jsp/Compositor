@@ -1,6 +1,5 @@
-#![allow(non_camel_case_types)]
+#![expect(non_camel_case_types)]
 
-use anyhow::Context;
 use smithay::reexports::drm;
 
 #[derive(Debug)]
@@ -33,8 +32,22 @@ struct drm_format_modifier_blob_header {
     modifiers_offset: u32,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum DrmFormatParseError {
+    #[error("expected v1 of `drm_format_modifier_blob`, got {0}")]
+    InvalidVersion(u32),
+    #[error("Overflow occurred during pointer arithmetic")]
+    PointerOverflow,
+    #[error("valid header not present in the blob provided by drm")]
+    InvalidHeader,
+    #[error("formats slice out of bounds")]
+    FormatsOutOfBounds,
+    #[error("modifiers slice out of bounds")]
+    ModifiersOutOfBounds,
+}
+
 impl drm_format_modifier_blob {
-    pub fn read(blob: &[u8]) -> anyhow::Result<Self> {
+    pub fn read(blob: &[u8]) -> Result<drm_format_modifier_blob, DrmFormatParseError> {
         // SAFETY: the header's contents are all integer types, so are valid for any bit pattern...
         let drm_format_modifier_blob_header {
             version,
@@ -44,21 +57,15 @@ impl drm_format_modifier_blob {
             count_modifiers,
             modifiers_offset,
         } = unsafe {
-            extract_array(
-                blob,
-                1,
-                0,
-                "valid header not present in the blob provided by drm",
-            )?
-            .pop()
-            .unwrap()
+            extract_array(blob, 1, 0, DrmFormatParseError::InvalidHeader)?
+                .pop()
+                .unwrap()
         };
 
         // Check that this is v1 to not break under future versions
-        anyhow::ensure!(
-            version == 1,
-            "expected v1 of `drm_format_modifier_blob`, got {version}"
-        );
+        if version != 1 {
+            return Err(DrmFormatParseError::InvalidVersion(version));
+        }
 
         // SAFETY: u32-s are valid for any bit pattern.
         let formats = unsafe {
@@ -66,7 +73,7 @@ impl drm_format_modifier_blob {
                 blob,
                 count_formats,
                 formats_offset,
-                "formats slice out of bounds",
+                DrmFormatParseError::FormatsOutOfBounds,
             )
         }?;
 
@@ -76,7 +83,7 @@ impl drm_format_modifier_blob {
                 blob,
                 count_modifiers,
                 modifiers_offset,
-                "modifiers slice out of bounds",
+                DrmFormatParseError::ModifiersOutOfBounds,
             )
         }?;
 
@@ -119,19 +126,19 @@ unsafe fn extract_array<T>(
     blob: &[u8],
     count: u32,
     offset: u32,
-    msg: &'static str,
-) -> Result<Vec<T>, anyhow::Error> {
+    err: DrmFormatParseError,
+) -> Result<Vec<T>, DrmFormatParseError> {
     let src = blob
         .get(
             (offset as usize)
                 ..((offset as usize).checked_add(
                     size_of::<T>()
                         .checked_mul(count as usize)
-                        .context("overflow in pointer arithmetic")?,
+                        .ok_or(DrmFormatParseError::PointerOverflow)?,
                 ))
-                .context("overflow in pointer arithmetic")?,
+                .ok_or(DrmFormatParseError::PointerOverflow)?,
         )
-        .context(msg)?;
+        .ok_or(err)?;
 
     let mut dest = Vec::new();
     dest.reserve_exact(count as _);

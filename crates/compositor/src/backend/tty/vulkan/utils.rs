@@ -2,6 +2,8 @@ use std::{collections::HashSet, ffi::CStr, ops::Deref, os::fd::{AsRawFd, FromRaw
 
 use smithay::reexports::ash::{self, vk::{self, Handle}};
 
+use crate::backend::tty::{Card, drmx, vulkan::VulkanError};
+
 #[cfg(debug_assertions)]
 const REQUIRED_INSTANCE_EXTENSIONS: &[&CStr] = &[ash::ext::debug_utils::NAME];
 #[cfg(debug_assertions)]
@@ -98,8 +100,9 @@ impl Drop for DebugUtils {
     }
 }
 
+
 impl Instance {
-    pub fn load() -> anyhow::Result<Self> {
+    pub fn load() -> Result<Self, VulkanError> {
         // SAFETY: We will not use functions on this instance after destroying it.
         let entry = unsafe { ash::Entry::load()? };
 
@@ -123,11 +126,12 @@ impl Instance {
         log::trace!("Vulkan Version: {version:?}");
 
         if raw_version < MINIMUM_VULKAN_VERSION {
-            return Err(anyhow::anyhow!(
-                "your driver's Vulkan version ({}.{}.{}) is below the 1.1.x minimum",
+            return Err(VulkanError::Other(
+                format!("Your driver's Vulkan version ({0}.{1}.{2}) is below the 1.1.x minimum.",
                 version.0,
                 version.1,
                 version.2
+            )
             ));
         }
 
@@ -140,8 +144,8 @@ impl Instance {
                     REQUIRED_INSTANCE_LAYERS,
                 )
                 .map_err(|_| {
-                    anyhow::anyhow!(
-                        "the VK_LAYER_KHRONOS_validation layer is required for debug builds"
+                    VulkanError::Other(
+                        "Missing layer: VK_LAYER_KHRONOS_validation".to_string()
                     )
                 })?
             };
@@ -155,7 +159,7 @@ impl Instance {
                     REQUIRED_INSTANCE_EXTENSIONS,
                 )
                 .map_err(|_| {
-                    anyhow::anyhow!("your graphics device should support VK_EXT_debug_utils")
+                    VulkanError::Other("Missing layer: VK_EXT_debug_utils".to_string())
                 })?
             };
 
@@ -211,7 +215,7 @@ impl Instance {
         })
     }
 
-    pub fn device_for(self, card: &super::Card) -> anyhow::Result<Device> {
+    pub fn device_for(self, card: &Card) -> Result<Device, VulkanError> {
         let instance = self;
         let devices = unsafe { instance.enumerate_physical_devices()? };
 
@@ -243,14 +247,14 @@ impl Instance {
             
                 found.then_some((api_version, device))
             })
-            .ok_or(anyhow::anyhow!("your graphics device does not support Vulkan, or you are using a multi-GPU setup which is not supported"))?;
+            .ok_or_else(|| VulkanError::Other("your graphics device does not support Vulkan, or you are using a multi-GPU setup which is not supported".to_string()))?;
 
         if api_version < PREFERRED_VULKAN_VERSION {
-            return Err(anyhow::anyhow!(
+            log::warn!(
                 "graphics device only supports Vulkan {}.{}, but 1.3 is required",
                 vk::api_version_major(api_version),
                 vk::api_version_minor(api_version),
-            ));
+            );
         }
 
         let queue_families =
@@ -260,8 +264,8 @@ impl Instance {
             .iter()
             .position(|queue| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS))
         else {
-            return Err(anyhow::anyhow!(
-                "Cannot find GRAPHICS queue family on the (physical) graphics device."
+            return Err(VulkanError::Other(
+                "Cannot find GRAPHICS queue family on the (physical) graphics device.".to_string()
             ));
         };
 
@@ -272,8 +276,8 @@ impl Instance {
         ) {
             Ok(exts) => exts,
             Err(missing) => {
-                return Err(anyhow::anyhow!(
-                    "your graphics device is missing the following Vulkan device extensions: {missing:?}"
+                return Err(VulkanError::Other(
+                    format!("your graphics device is missing the following Vulkan device extensions: {missing:?}")
                 ));
             }
         };
@@ -291,8 +295,8 @@ impl Instance {
                 || check13.synchronization2 != vk::TRUE
                 || check13.dynamic_rendering != vk::TRUE
             {
-                return Err(anyhow::anyhow!(
-                    "device lacks required Vulkan 1.2 and/or 1.3 features"
+                return Err(VulkanError::Other(
+                    "device lacks required Vulkan 1.2 and/or 1.3 features: timeline_semaphore, synchronization2, dynamic_rendering".to_string()
                 ));
             }
         }
@@ -508,17 +512,35 @@ impl ImportableFence {
     }
 }
 
-pub struct CommandPool(Arc<Device>, vk::CommandPool);
+pub struct CommandPool {
+    device: Arc<Device>,
+    pool: vk::CommandPool,
+}
 
 impl CommandPool {
-    pub fn new(device: Arc<Device>, command_pool: vk::CommandPool) -> Self {
-        Self(device, command_pool)
+    pub fn new(device: Arc<Device>) -> ash::prelude::VkResult<Self> {
+        let info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(device.queue_family)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        Ok(CommandPool {
+            pool: unsafe { device.create_command_pool(&info, None) }?,
+            device,
+        })
     }
 }
 
 impl Drop for CommandPool {
     fn drop(&mut self) {
-        unsafe {self.0.destroy_command_pool(self.1, None); }
+        unsafe {
+            self.device.destroy_command_pool(self.pool, None);
+        }
+    }
+}
+impl std::ops::Deref for CommandPool {
+    type Target = vk::CommandPool;
+
+    fn deref(&self) -> &Self::Target {
+        &self.pool
     }
 }
 
@@ -572,4 +594,27 @@ unsafe extern "system" fn callback(
     }
 
     vk::FALSE
+}
+
+impl From<drmx::Format> for vk::Format {
+    fn from(value: drmx::Format) -> Self {
+        use smithay::reexports::gbm::Format as G;
+        use vk::Format as F;
+        match value.0 {
+            G::Xrgb8888 => F::B8G8R8A8_UNORM,
+            G::Argb8888 => F::B8G8R8A8_UNORM,
+            G::Xbgr8888 => F::R8G8B8A8_UNORM,
+            G::Abgr8888 => F::R8G8B8A8_UNORM,
+
+            // HDR
+            G::Xbgr2101010 => F::A2B10G10R10_UNORM_PACK32,
+            G::Abgr2101010 => F::A2B10G10R10_UNORM_PACK32,
+
+            G::Rgb565 => F::R5G6B5_UNORM_PACK16,
+
+            G::Abgr16161616f => F::R16G16B16A16_SFLOAT,
+
+            _ => panic!("unsupported color format"),
+        }
+    }
 }

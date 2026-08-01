@@ -6,7 +6,6 @@ use std::{
     sync::Arc,
 };
 
-use anyhow::Context;
 use smithay::reexports::{
     drm::{
         self,
@@ -17,11 +16,11 @@ use smithay::reexports::{
 
 pub use smithay::reexports::drm::control::AtomicCommitFlags;
 
-use crate::backend::tty::Card;
+use crate::backend::tty::drmx::Card;
 
 #[derive(Debug)]
 pub struct AtomicRequestCache {
-    card: Arc<gbm::Device<super::Card>>,
+    card: Arc<gbm::Device<Card>>,
     cache: HashMap<RawResourceHandle, HashMap<String, property::Handle>>,
 }
 
@@ -39,13 +38,28 @@ impl<'a> Drop for AtomicRequest<'a> {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum AtomicReqError {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<String> for AtomicReqError {
+    fn from(value: String) -> Self {
+        Self::Other(value)
+    }
+}
+
 impl<'a> AtomicRequest<'a> {
     pub fn set<H: drm::control::ResourceHandle, P: Property<'a, H>>(
         mut self,
         target: H,
         prop: P,
         value: P::Type,
-    ) -> anyhow::Result<Self> {
+    ) -> Result<Self, AtomicReqError> {
         let atomic_value = value.to_value(&self.cache.card)?;
         self.request.add_property(
             target,
@@ -83,7 +97,7 @@ impl<'a> AtomicRequest<'a> {
 }
 
 impl AtomicRequestCache {
-    pub fn new(card: Arc<gbm::Device<super::Card>>) -> Self {
+    pub fn new(card: Arc<gbm::Device<Card>>) -> Self {
         Self {
             card,
             cache: Default::default(),
@@ -94,12 +108,15 @@ impl AtomicRequestCache {
         &mut self,
         target: H,
         _: P,
-    ) -> anyhow::Result<drm::control::property::Handle> {
+    ) -> Result<drm::control::property::Handle, AtomicReqError> {
         let prop = if let Some(props) = self.cache.get(&target.into()) {
             if let Some(&prop) = props.get(P::NAME) {
                 prop
             } else {
-                anyhow::bail!("Property does not exist on this resource!");
+                return Err(AtomicReqError::Other(format!(
+                    "{} Property does not exist on this resource!",
+                    P::NAME
+                )));
             }
         } else {
             let map = self
@@ -110,10 +127,12 @@ impl AtomicRequestCache {
                 .map(|(name, info)| (name, info.handle()))
                 .collect::<HashMap<_, _>>();
 
-            let prop = map
-                .get(P::NAME)
-                .copied()
-                .context("Property does not exist on this resource")?;
+            let prop = map.get(P::NAME).copied().ok_or_else(|| {
+                AtomicReqError::Other(format!(
+                    "{} Property does not exist on this resource!",
+                    P::NAME
+                ))
+            })?;
 
             self.cache.insert(target.into(), map);
 
@@ -330,7 +349,7 @@ impl AtomicReqType for Option<OwnedFd> {
 pub mod props {
     use std::os::fd::{OwnedFd, RawFd};
 
-    use crate::backend::tty::atomic_req::ToBlob;
+    use crate::backend::tty::drmx::atomic_req::ToBlob;
 
     use super::{Fixed16, Property};
     use smithay::reexports::drm;

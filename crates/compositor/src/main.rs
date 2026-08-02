@@ -1,3 +1,5 @@
+#![feature(error_generic_member_access)]
+
 pub mod backend;
 pub mod colors;
 pub mod config;

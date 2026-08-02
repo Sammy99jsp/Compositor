@@ -41,7 +41,11 @@ impl<'a> Drop for AtomicRequest<'a> {
 #[derive(Debug, thiserror::Error)]
 pub enum AtomicReqError {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(
+        #[from]
+        #[backtrace]
+        std::io::Error,
+    ),
 
     #[error("{0}")]
     Other(String),

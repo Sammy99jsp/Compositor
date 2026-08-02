@@ -71,10 +71,18 @@ const LEN: usize = 3;
 #[derive(thiserror::Error)]
 pub enum ScanoutError<B: Backend> {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(
+        #[from]
+        #[backtrace]
+        std::io::Error,
+    ),
 
     #[error(transparent)]
-    DrmFormat(#[from] drmx::format_modifier::DrmFormatParseError),
+    DrmFormat(
+        #[from]
+        #[backtrace]
+        drmx::format_modifier::DrmFormatParseError,
+    ),
 
     #[error("cannot get supported formats")]
     CannotGetDrmFormats,
@@ -83,7 +91,11 @@ pub enum ScanoutError<B: Backend> {
     Backend(B::Error),
 
     #[error(transparent)]
-    Modeset(#[from] ModesetError),
+    Modeset(
+        #[backtrace]
+        #[from]
+        ModesetError,
+    ),
 }
 
 impl<B: Backend> std::fmt::Debug for ScanoutError<B>
@@ -104,9 +116,17 @@ where
 #[derive(Debug, thiserror::Error)]
 pub enum ModesetError {
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(
+        #[from]
+        #[backtrace]
+        std::io::Error,
+    ),
     #[error(transparent)]
-    AtomicReq(#[from] drmx::atomic_req::AtomicReqError),
+    AtomicReq(
+        #[from]
+        #[backtrace]
+        drmx::atomic_req::AtomicReqError,
+    ),
 }
 
 pub struct BufferedOutput<B: Backend> {

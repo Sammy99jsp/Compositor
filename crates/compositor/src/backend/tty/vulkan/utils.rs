@@ -128,13 +128,12 @@ impl Instance {
         log::trace!("Vulkan Version: {version:?}");
 
         if raw_version < MINIMUM_VULKAN_VERSION {
-            return Err(VulkanError::Other(
+            return Err(
                 format!("Your driver's Vulkan version ({0}.{1}.{2}) is below the 1.1.x minimum.",
                 version.0,
                 version.1,
                 version.2
-            )
-            ));
+            ).into());
         }
 
         #[cfg(debug_assertions)]
@@ -146,9 +145,7 @@ impl Instance {
                     REQUIRED_INSTANCE_LAYERS,
                 )
                 .map_err(|_| {
-                    VulkanError::Other(
-                        "Missing layer: VK_LAYER_KHRONOS_validation".to_string()
-                    )
+                        VulkanError::from("Missing layer: VK_LAYER_KHRONOS_validation".to_string())
                 })?
             };
             let extensions = {
@@ -161,7 +158,7 @@ impl Instance {
                     REQUIRED_INSTANCE_EXTENSIONS,
                 )
                 .map_err(|_| {
-                    VulkanError::Other("Missing layer: VK_EXT_debug_utils".to_string())
+                    VulkanError::from("Missing layer: VK_EXT_debug_utils".to_string())
                 })?
             };
 
@@ -249,7 +246,7 @@ impl Instance {
             
                 found.then_some((api_version, device))
             })
-            .ok_or_else(|| VulkanError::Other("your graphics device does not support Vulkan, or you are using a multi-GPU setup which is not supported".to_string()))?;
+            .ok_or_else(||  VulkanError::from("your graphics device does not support Vulkan, or you are using a multi-GPU setup which is not supported".to_string()))?;
 
         if api_version < MAX_VULKAN_VERSION {
             log::warn!(
@@ -266,7 +263,7 @@ impl Instance {
             .iter()
             .position(|queue| queue.queue_flags.contains(vk::QueueFlags::GRAPHICS))
         else {
-            return Err(VulkanError::Other(
+            return Err( VulkanError::from(
                 "Cannot find GRAPHICS queue family on the (physical) graphics device.".to_string()
             ));
         };
@@ -278,7 +275,7 @@ impl Instance {
         ) {
             Ok(exts) => exts,
             Err(missing) => {
-                return Err(VulkanError::Other(
+                return Err( VulkanError::from(
                     format!("your graphics device is missing the following Vulkan device extensions: {missing:?}")
                 ));
             }
@@ -297,7 +294,7 @@ impl Instance {
                 || check13.synchronization2 != vk::TRUE
                 || check13.dynamic_rendering != vk::TRUE
             {
-                return Err(VulkanError::Other(
+                return Err( VulkanError::from(
                     "device lacks required Vulkan 1.2 and/or 1.3 features: timeline_semaphore, synchronization2, dynamic_rendering".to_string()
                 ));
             }

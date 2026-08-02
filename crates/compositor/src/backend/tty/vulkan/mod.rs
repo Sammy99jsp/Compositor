@@ -1,4 +1,5 @@
 use std::{
+    backtrace::Backtrace,
     collections::HashSet,
     os::{fd::AsRawFd, unix::prelude::OwnedFd},
     sync::Arc,
@@ -65,27 +66,49 @@ pub struct VulkanBuffer {
 #[derive(Debug, Error)]
 pub enum VulkanError {
     #[error(transparent)]
-    Loading(#[from] ash::LoadingError),
+    Loading(
+        #[from]
+        #[backtrace]
+        ash::LoadingError,
+    ),
 
     #[error(transparent)]
-    Vulkan(#[from] ash::vk::Result),
+    Vulkan(
+        #[from]
+        #[backtrace]
+        ash::vk::Result,
+    ),
 
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(
+        #[backtrace]
+        #[from]
+        std::io::Error,
+    ),
 
     #[error("no supported DMA memory type can be imported into Vulkan")]
     UnsupportedDmaMemory,
 
     #[error(transparent)]
-    Fd(#[from] gbm::InvalidFdError),
+    Fd(
+        #[from]
+        #[backtrace]
+        gbm::InvalidFdError,
+    ),
 
-    #[error("{0}")]
-    Other(String),
+    #[error("{reason}")]
+    Other {
+        reason: String,
+        backtrace: Backtrace,
+    },
 }
 
 impl From<String> for VulkanError {
-    fn from(value: String) -> Self {
-        Self::Other(value)
+    fn from(reason: String) -> Self {
+        Self::Other {
+            reason,
+            backtrace: Backtrace::capture(),
+        }
     }
 }
 

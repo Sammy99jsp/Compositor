@@ -53,7 +53,7 @@ const APP_VERSION: u32 = {
     vk::make_api_version(0, major, minor, patch)
 };
 
-const PREFERRED_VULKAN_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
+pub const MAX_VULKAN_VERSION: u32 = vk::make_api_version(0, 1, 3, 0);
 const MINIMUM_VULKAN_VERSION: u32 = vk::make_api_version(0, 1, 1, 0);
 
 pub struct Instance {
@@ -185,7 +185,7 @@ impl Instance {
         let app_info = vk::ApplicationInfo::default()
             .application_name(APP_NAME)
             .application_version(APP_VERSION)
-            .api_version(PREFERRED_VULKAN_VERSION);
+            .api_version(MAX_VULKAN_VERSION);
 
         let create_info = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
@@ -251,7 +251,7 @@ impl Instance {
             })
             .ok_or_else(|| VulkanError::Other("your graphics device does not support Vulkan, or you are using a multi-GPU setup which is not supported".to_string()))?;
 
-        if api_version < PREFERRED_VULKAN_VERSION {
+        if api_version < MAX_VULKAN_VERSION {
             log::warn!(
                 "graphics device only supports Vulkan {}.{}, but 1.3 is required",
                 vk::api_version_major(api_version),

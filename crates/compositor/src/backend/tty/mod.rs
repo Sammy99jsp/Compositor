@@ -7,7 +7,7 @@ use std::{
 
 use smithay::reexports::{
     drm::{self, control::Device as _},
-    gbm,
+    gbm, rustix,
 };
 
 use crate::backend::tty::utils::Guard;
@@ -39,7 +39,14 @@ pub trait Backend {
         bo: gbm::BufferObject<()>,
     ) -> Result<Self::Buffer, Self::Error>;
 
-    fn render(&mut self, buffer: &mut Self::Buffer, frame: usize) -> Result<Poll<()>, Self::Error>;
+    fn render<F>(
+        &mut self,
+        buffer: &mut Self::Buffer,
+        frame: usize,
+        callback: F,
+    ) -> Result<Poll<()>, Self::Error>
+    where
+        F: for<'a> FnMut(&'a skia_safe::Canvas);
 }
 
 pub trait BackendBuffer {
@@ -104,6 +111,7 @@ pub enum ModesetError {
 
 pub struct BufferedOutput<B: Backend> {
     pub frame: usize,
+    pub on_screen: Option<usize>,
     queue: VecDeque<ScanoutRequest>,
     pub drm: DrmState,
     pub backend: B,
@@ -159,6 +167,7 @@ impl<B: Backend> BufferedOutput<B> {
             backend,
             buffers,
             frame: 0,
+            on_screen: None,
             queue: VecDeque::with_capacity(3),
         };
 
@@ -196,12 +205,17 @@ impl<B: Backend> BufferedOutput<B> {
         Ok(())
     }
 
-    pub fn render(&mut self) -> Result<Poll<()>, B::Error> {
+    pub fn render<F>(&mut self, render_fn: F) -> Result<Poll<()>, B::Error>
+    where
+        F: for<'a> FnMut(&'a skia_safe::Canvas),
+    {
         let frame_i = self.frame % 3;
         let buffer = &mut self.buffers[frame_i];
 
         log::trace!("Backend render start.");
-        let poll = self.backend.render(&mut buffer.backend, self.frame)?;
+        let poll = self
+            .backend
+            .render(&mut buffer.backend, self.frame, render_fn)?;
         log::trace!("Backend render end.");
         if let Poll::Ready(()) = poll {
             self.frame += 1;
@@ -214,7 +228,8 @@ impl<B: Backend> BufferedOutput<B> {
     pub fn flip(&mut self) -> Result<Poll<()>, ScanoutError<B>> {
         use drmx::atomic_req::*;
 
-        let Some(ScanoutRequest { frame_i }) = self.queue.pop_front() else {
+        let Some(ScanoutRequest { frame_i }) = self.queue.front().copied() else {
+            log::trace!("Waiting for rendered frames!");
             return Ok(Poll::Pending);
         };
 
@@ -223,7 +238,8 @@ impl<B: Backend> BufferedOutput<B> {
         let mut out_fd: RawFd = -1;
 
         log::trace!("Modesetting request!");
-        drm.cache
+        let res = drm
+            .cache
             .request()
             .set(drm.plane, FB_ID, Some(buffer.framebuffer))
             .map_err(ModesetError::from)?
@@ -238,7 +254,17 @@ impl<B: Backend> BufferedOutput<B> {
             .map_err(ModesetError::from)?
             .set(drm.crtc, OUT_FENCE_PTR, &raw mut out_fd)
             .map_err(ModesetError::from)?
-            .commit(AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK)?;
+            .commit(AtomicCommitFlags::PAGE_FLIP_EVENT | AtomicCommitFlags::NONBLOCK);
+
+        match res {
+            Ok(()) => {
+                let _ = self.queue.pop_front();
+            }
+            Err(err) if err.raw_os_error() == Some(rustix::io::Errno::BUSY.raw_os_error()) => {
+                return Ok(Poll::Pending);
+            }
+            Err(err) => return Err(ScanoutError::Io(err)),
+        }
 
         if out_fd == -1 {
             panic!("OUT_FENCE_PTR is invalid!");
@@ -246,15 +272,20 @@ impl<B: Backend> BufferedOutput<B> {
 
         let out_fd = unsafe { OwnedFd::from_raw_fd(out_fd) };
         log::trace!("Backend import syncfile");
-        buffer
-            .backend
-            .import_sync(&mut self.backend, out_fd)
-            .map_err(ScanoutError::Backend)?;
+
+        // The out-fence releases the buffer that was on screen *before* this flip.
+        if let Some(prev) = self.on_screen.replace(frame_i) {
+            self.buffers[prev]
+                .backend
+                .import_sync(&mut self.backend, out_fd)
+                .map_err(ScanoutError::Backend)?;
+        }
 
         Ok(Poll::Ready(()))
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct ScanoutRequest {
     pub frame_i: usize,
 }

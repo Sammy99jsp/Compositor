@@ -66,7 +66,15 @@ impl Backend for Cpu {
         })
     }
 
-    fn render(&mut self, buffer: &mut Self::Buffer, frame: usize) -> Result<Poll<()>, Self::Error> {
+    fn render<F>(
+        &mut self,
+        buffer: &mut Self::Buffer,
+        frame: usize,
+        mut callback: F,
+    ) -> Result<Poll<()>, Self::Error>
+    where
+        F: for<'a> FnMut(&'a skia_safe::Canvas),
+    {
         // Wait on the imported sync file.
         if let Some(sync) = &buffer.fence {
             const TIMEOUT: i32 = rustix::io::Errno::TIME.raw_os_error();
@@ -96,37 +104,10 @@ impl Backend for Cpu {
                 skia_safe::surfaces::wrap_pixels(&info, pxs.buffer_mut(), stride as usize, None)
                     .expect("Valid skia surface");
 
-            let canvas = surface.canvas();
-
-            canvas.clear(skia_safe::Color4f {
-                r: 1.0,
-                g: 0.0,
-                b: 1.0,
-                a: 1.0,
-            });
-
-            let f = skia_safe::FontMgr::new();
-            let mut a = f.match_family("Arvo");
-            let fface = a
-                .match_style(skia_safe::FontStyle::bold())
-                .expect("Find font");
-            let font = &skia_safe::Font::new(fface, 128.0);
-            let paint = skia_safe::Paint::new(
-                skia_safe::Color4f {
-                    r: 0.0,
-                    g: 0.0,
-                    b: 0.0,
-                    a: 1.0,
-                },
-                None,
-            );
-            canvas.draw_text_align(
-                format!("{frame}"),
-                (100.0, 100.0),
-                font,
-                &paint,
-                skia_safe::utils::text_utils::Align::Left,
-            );
+            {
+                let canvas = surface.canvas();
+                callback(canvas);
+            }
 
             Poll::Ready(())
         })

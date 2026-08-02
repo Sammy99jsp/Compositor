@@ -19,6 +19,7 @@ use crate::backend::tty::{
     self, BufferedOutput,
     cpu::Cpu,
     drmx::{self, DrmEventNotifier},
+    vulkan::Vulkan,
 };
 
 fn main() -> anyhow::Result<()> {
@@ -114,17 +115,15 @@ fn main() -> anyhow::Result<()> {
         .find_map(|(p, ty, props)| (ty == drm::control::PlaneType::Primary).then_some((p, props)))
         .ok_or(anyhow::anyhow!("cannot find suitable primary plane"))?;
 
-    let format = drmx::Format(gbm::Format::Xrgb8888);
-
-    // let mut skia = device.clone().skia_context()?;
+    let format = drmx::Format(gbm::Format::Argb8888);
 
     let mut output =
-        BufferedOutput::new(card.clone(), crtc, plane, mode, connector.handle(), format)?;
+        BufferedOutput::<Vulkan>::new(card.clone(), crtc, plane, mode, connector.handle(), format)?;
     let mut event_loop = calloop::EventLoop::try_new()?;
 
     event_loop.handle().insert_source(
         DrmEventNotifier::new(card.clone()),
-        |event, _, output: &mut BufferedOutput<Cpu>| {
+        |event, _, output: &mut BufferedOutput<_>| {
             if let drm::control::Event::PageFlip(page_flip_event) = event {
                 log::trace!(
                     "Flip event! {:?} @ {:?}",
@@ -144,7 +143,7 @@ fn main() -> anyhow::Result<()> {
     event_loop
         .handle()
         .insert_source(
-            calloop::timer::Timer::from_duration(Duration::from_secs(10)),
+            calloop::timer::Timer::from_duration(Duration::from_secs(2)),
             move |_, _, _| {
                 signal.stop();
                 calloop::timer::TimeoutAction::Drop
@@ -152,21 +151,53 @@ fn main() -> anyhow::Result<()> {
         )
         .map_err(|a| a.error)?;
 
-    let Poll::Ready(()) = output.render()? else {
-        panic!("First buffer is still being scanned! Should not be the case!")
+    let mut frame = 0usize;
+    let mgr = skia_safe::FontMgr::new();
+    let mut family = mgr.match_family("Inter");
+    let typeface = family
+        .match_style(skia_safe::FontStyle::normal())
+        .expect("Iter");
+    let font = skia_safe::Font::from_typeface(typeface, 128.0);
+    let paint = skia_safe::Paint::new(skia_safe::Color4f::new(0.0, 0.0, 0.0, 1.0), None);
+
+    let mut callback = move |canvas: &skia_safe::Canvas| {
+        canvas.clear(skia_safe::Color4f {
+            r: 1.0,
+            g: 1.0,
+            b: 1.0,
+            a: 1.0,
+        });
+
+        canvas.draw_text_align(
+            format!("{frame}"),
+            (100., 100.),
+            &font,
+            &paint,
+            skia_safe::utils::text_utils::Align::Left,
+        );
+
+        frame += 1;
     };
 
-    log::trace!("Before Flip page!");
-    let Poll::Ready(()) = output.flip()? else {
-        panic!("Should not have a problem with queuing an initial flip.")
-    };
-    
-    log::trace!("After Flip page!");
+    if let Err(err) = output.render(&mut callback) {
+        log::error!("Error during initial render: {err:?}");
+    }
+    if let Err(err) = output.render(&mut callback) {
+        log::error!("Error during second render: {err:?}");
+    }
+    if let Err(err) = output.flip() {
+        log::error!("Error during initial page flip: {err:?}");
+    }
+
+    log::trace!("Starting render loop");
     let now = std::time::Instant::now();
     event_loop.run(
-        Some(Duration::from_millis(5)),
+        Some(Duration::from_micros(5_000)),
         &mut output,
-        |output| match output.render().expect("No error within render loop") {
+        |output| match output
+            .render(&mut callback)
+            .expect("No error within render loop")
+        {
             Poll::Ready(()) => (),
             Poll::Pending => (),
         },

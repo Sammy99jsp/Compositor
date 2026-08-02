@@ -13,10 +13,10 @@ impl Format {
         use skia_safe::ColorType as S;
 
         match self.0 {
-            G::Xrgb8888 => S::RGB888x,
-            G::Argb8888 => S::RGBA8888,
-            G::Xbgr8888 => S::BGRA8888,
-            G::Abgr8888 => S::BGRA8888,
+            G::Xrgb8888 => S::BGRA8888,
+            G::Argb8888 => S::BGRA8888,
+            G::Xbgr8888 => S::RGB888x,
+            G::Abgr8888 => S::RGBA8888,
 
             // HDR
             G::Xbgr2101010 => S::BGR101010x,

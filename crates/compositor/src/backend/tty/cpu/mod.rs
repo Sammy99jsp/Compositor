@@ -13,7 +13,10 @@ use smithay::reexports::{
     gbm, rustix,
 };
 
-use crate::backend::tty::{Backend, BackendBuffer, drmx::Format};
+use crate::backend::tty::{
+    Backend, BackendBuffer,
+    drmx::{self, Format},
+};
 
 use super::Card;
 
@@ -23,7 +26,6 @@ pub struct Cpu {
 
 pub struct CpuBuffer {
     bo: gbm::BufferObject<()>,
-    format: Format,
     fence: Option<ImportedSyncFile>,
 }
 
@@ -31,11 +33,8 @@ const TIMEOUT_NSEC: i64 = 500_000; // 0.5ms
 
 impl Backend for Cpu {
     const NAME: &str = "CPU";
-    const BUFFER_FLAGS: gbm::BufferObjectFlags = const {
-        gbm::BufferObjectFlags::SCANOUT
-            .union(gbm::BufferObjectFlags::LINEAR)
-            .union(gbm::BufferObjectFlags::WRITE)
-    };
+    const BUFFER_FLAGS: gbm::BufferObjectFlags =
+        const { gbm::BufferObjectFlags::SCANOUT.union(gbm::BufferObjectFlags::LINEAR) };
     type Error = std::io::Error;
 
     fn new(card: &Arc<Card>) -> Result<Self, Self::Error>
@@ -59,11 +58,7 @@ impl Backend for Cpu {
         drm: &super::DrmState,
         bo: gbm::BufferObject<()>,
     ) -> Result<Self::Buffer, Self::Error> {
-        Ok(CpuBuffer {
-            bo,
-            fence: None,
-            format: drm.format,
-        })
+        Ok(CpuBuffer { bo, fence: None })
     }
 
     fn render<F>(
@@ -89,12 +84,12 @@ impl Backend for Cpu {
         }
 
         let (width, height) = (buffer.bo.width(), buffer.bo.height());
-        let format = buffer.format;
+        let format = drmx::Format(buffer.bo.format());
 
         buffer.bo.map_mut(0, 0, width, height, |pxs| {
             let info = skia_safe::ImageInfo::new(
                 (width as _, height as _),
-                format.skia(),
+                format.try_into().unwrap(),
                 skia_safe::AlphaType::Premul,
                 None,
             );

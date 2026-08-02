@@ -86,10 +86,10 @@ impl Card {
         match cards.len() {
             0 if is_overridden => {
                 return Err(anyhow::anyhow!(
-                    "device specified by NADVA_DRM_DEVICE is not usable"
+                    "device specified by NADVA_DRM_DEVICE is not usable: either no connected connectors, and/or no (atomic + universal plane capability)"
                 ));
             }
-            0 => return Err(anyhow::anyhow!("No suitable graphics devices!")),
+            0 => return Err(anyhow::anyhow!("No suitable graphics devices found! either no connected connectors, and/or no (atomic + universal plane capability)")),
             1 => return Ok(cards.pop().unwrap()),
             _ => (),
         }

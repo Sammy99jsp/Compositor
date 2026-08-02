@@ -5,9 +5,12 @@ use std::{
     task::Poll,
 };
 
-use smithay::reexports::{
-    drm::{self, control::Device as _},
-    gbm, rustix,
+use smithay::{
+    reexports::{
+        drm::{self, control::Device as _},
+        gbm, rustix,
+    },
+    utils::DevPath,
 };
 
 use crate::backend::tty::utils::Guard;
@@ -87,6 +90,9 @@ pub enum ScanoutError<B: Backend> {
     #[error("cannot get supported formats")]
     CannotGetDrmFormats,
 
+    #[error("could not allocate buffers in the following 'supported' formats: {0:?}")]
+    NoSuitableFormats(Vec<drmx::Format>),
+
     #[error(transparent)]
     Backend(B::Error),
 
@@ -109,6 +115,9 @@ where
             Self::CannotGetDrmFormats => write!(f, "CannotGetDrmFormats"),
             Self::Backend(arg0) => f.debug_tuple("Backend").field(arg0).finish(),
             Self::Modeset(arg0) => f.debug_tuple("Modeset").field(arg0).finish(),
+            Self::NoSuitableFormats(arg0) => {
+                f.debug_tuple("NoSuitableFormats").field(arg0).finish()
+            }
         }
     }
 }
@@ -145,42 +154,56 @@ impl<B: Backend> BufferedOutput<B> {
         plane: drm::control::plane::Handle,
         mode: drm::control::Mode,
         connector: drm::control::connector::Handle,
-        format: drmx::Format,
+        formats: Vec<drmx::Format>,
     ) -> Result<Self, ScanoutError<B>> {
         let backend = B::new(&card).map_err(ScanoutError::Backend)?;
 
-        // Format modifiers...
-        let modifiers = {
-            // DRM
-            let drm_modifiers =
-                drm_modifiers::<B>(&card, format.fourcc(), &card.get_properties(plane)?)?;
+        let (drm, buffers) = formats
+            .iter()
+            .copied()
+            .find_map(|format| {
+                // Format modifiers...
+                let modifiers = {
+                    // DRM
+                    let drm_modifiers = drm_modifiers::<B>(
+                        &card,
+                        format.fourcc(),
+                        &card.get_properties(plane).ok()?,
+                    )
+                    .ok()?;
 
-            // Provided by backend...
-            let backend_modifiers = backend.modifiers(format, &drm_modifiers);
+                    // Provided by backend...
+                    let backend_modifiers = backend.modifiers(format, &drm_modifiers);
 
-            // Intersect the DRM- and Vulkan-provided format modifiers
+                    // Intersect the DRM- and Vulkan-provided format modifiers
 
-            backend_modifiers
-                .intersection(&drm_modifiers)
-                .copied()
-                .map(gbm::Modifier::from)
-                .collect::<Vec<_>>()
-        };
+                    backend_modifiers
+                        .intersection(&drm_modifiers)
+                        .copied()
+                        .map(gbm::Modifier::from)
+                        .chain([gbm::Modifier::Invalid])
+                        .collect::<Vec<_>>()
+                };
 
-        let drm = DrmState {
-            previous_state: card.get_crtc(crtc)?,
-            cache: drmx::atomic_req::AtomicRequestCache::new(card.clone()),
-            card,
-            crtc,
-            plane,
-            mode,
-            connector,
-            format,
-            modifiers,
-        };
+                let drm = DrmState {
+                    previous_state: card.get_crtc(crtc).expect("should be able to get the crtc"),
+                    cache: drmx::atomic_req::AtomicRequestCache::new(card.clone()),
+                    card: card.clone(),
+                    crtc,
+                    plane,
+                    mode,
+                    connector,
+                    modifiers,
+                };
+                let buffers = [
+                    ScanoutBuffer::<B>::new(&drm, format, &backend).ok()?,
+                    ScanoutBuffer::<B>::new(&drm, format, &backend).ok()?,
+                    ScanoutBuffer::<B>::new(&drm, format, &backend).ok()?,
+                ];
 
-        let [b1, b2, b3] = core::array::from_fn(|_| ScanoutBuffer::<B>::new(&drm, &backend));
-        let buffers = [b1?, b2?, b3?];
+                Some((drm, buffers))
+            })
+            .ok_or_else(|| ScanoutError::NoSuitableFormats(formats))?;
 
         let mut output = Self {
             drm,
@@ -317,7 +340,6 @@ pub struct DrmState {
     pub plane: drm::control::plane::Handle,
     pub mode: drm::control::Mode,
     pub connector: drm::control::connector::Handle,
-    pub format: drmx::Format,
     pub modifiers: Vec<gbm::Modifier>,
     pub previous_state: drm::control::crtc::Info,
 }
@@ -350,38 +372,46 @@ impl<B: Backend> Drop for ScanoutBuffer<B> {
 }
 
 impl<B: Backend> ScanoutBuffer<B> {
-    pub fn new(drm: &DrmState, backend: &B) -> Result<Self, ScanoutError<B>> {
+    pub fn new(drm: &DrmState, format: drmx::Format, backend: &B) -> Result<Self, ScanoutError<B>> {
         let (width, height) = drm.mode.size();
 
-        log::trace!("Making buffer object");
+        log::trace!(
+            "Making buffer object with available modifiers: {:?}",
+            drm.modifiers
+        );
 
-        let buffer_object: gbm::BufferObject<()> = if drm.modifiers.is_empty() {
+        let buffer_object: gbm::BufferObject<()> = if drm.modifiers.len() == 1 {
             // Linear Fallback.
             log::warn!(
-                "no common modifier between DRM plane and {}; falling back to linear",
+                "no common modifier between DRM plane and {}; continuing without modifiers.",
                 B::NAME
             );
 
             drm.card.create_buffer_object(
                 width as _,
                 height as _,
-                drm.format.fourcc(),
+                format.fourcc(),
                 B::BUFFER_FLAGS,
             )?
         } else {
             drm.card.create_buffer_object_with_modifiers2::<()>(
                 width as _,
                 height as _,
-                drm.format.fourcc(),
+                format.fourcc(),
                 drm.modifiers.iter().copied(),
                 B::BUFFER_FLAGS,
             )?
         };
 
+        let flags = if buffer_object.modifier() == gbm::Modifier::Invalid {
+            drm::control::FbCmd2Flags::empty()
+        } else {
+            drm::control::FbCmd2Flags::MODIFIERS
+        };
+
         log::trace!("Making framebuffer");
         let framebuffer = Guard::new(
-            drm.card
-                .add_planar_framebuffer(&buffer_object, drm::control::FbCmd2Flags::MODIFIERS)?,
+            drm.card.add_planar_framebuffer(&buffer_object, flags)?,
             |fb| {
                 let _ = drm.card.destroy_framebuffer(fb);
             },

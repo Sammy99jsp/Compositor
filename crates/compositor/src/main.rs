@@ -10,6 +10,7 @@ use std::{sync::Arc, task::Poll, time::Duration};
 
 use smithay::{
     reexports::{
+        ash::vk,
         calloop,
         drm::{self, Device, control::Device as _},
         gbm,
@@ -18,7 +19,7 @@ use smithay::{
 };
 
 use crate::backend::tty::{
-    self, BufferedOutput,
+    self, Backend, BufferedOutput,
     cpu::Cpu,
     drmx::{self, DrmEventNotifier},
     vulkan::Vulkan,
@@ -117,10 +118,32 @@ fn main() -> anyhow::Result<()> {
         .find_map(|(p, ty, props)| (ty == drm::control::PlaneType::Primary).then_some((p, props)))
         .ok_or(anyhow::anyhow!("cannot find suitable primary plane"))?;
 
-    let format = drmx::Format(gbm::Format::Argb8888);
+    // gbm::Format::
+    let mut compatible_formats = drmx::Format::iter()
+        .filter(|format| format.skia().is_some())
+        .filter(|&format| card.is_format_supported(format.fourcc(), Vulkan::BUFFER_FLAGS))
+        .collect::<Vec<_>>();
 
-    let mut output =
-        BufferedOutput::<Vulkan>::new(card.clone(), crtc, plane, mode, connector.handle(), format)?;
+    compatible_formats.sort_unstable_by_key(|a| a.rank());
+
+    log::trace!("Compatible Formats: {compatible_formats:?}");
+    let format = drmx::Format(gbm::Format::Abgr2101010);
+
+    log::trace!(
+        "Chose format : DRM {:?}; VK {:?}; SKIA: {:?}",
+        format.fourcc(),
+        vk::Format::from(format),
+        format.skia()
+    );
+
+    let mut output = BufferedOutput::<Vulkan>::new(
+        card.clone(),
+        crtc,
+        plane,
+        mode,
+        connector.handle(),
+        compatible_formats,
+    )?;
     let mut event_loop = calloop::EventLoop::try_new()?;
 
     event_loop.handle().insert_source(

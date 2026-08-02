@@ -598,21 +598,23 @@ unsafe extern "system" fn callback(
 impl From<drmx::Format> for vk::Format {
     fn from(value: drmx::Format) -> Self {
         use smithay::reexports::gbm::Format as G;
-        use vk::Format as F;
+        use vk::Format as V;
         match value.0 {
-            G::Xrgb8888 => F::B8G8R8A8_UNORM,
-            G::Argb8888 => F::B8G8R8A8_UNORM,
-            G::Xbgr8888 => F::R8G8B8A8_UNORM,
-            G::Abgr8888 => F::R8G8B8A8_UNORM,
+            G::Xrgb8888 => V::B8G8R8A8_UNORM,
+            G::Argb8888 => V::B8G8R8A8_UNORM,
+            G::Xbgr8888 => V::R8G8B8A8_UNORM,
+            G::Abgr8888 => V::R8G8B8A8_UNORM,
 
             // HDR
-            G::Xbgr2101010 => F::A2B10G10R10_UNORM_PACK32,
-            G::Abgr2101010 => F::A2B10G10R10_UNORM_PACK32,
-
-            G::Rgb565 => F::R5G6B5_UNORM_PACK16,
-
-            G::Abgr16161616f => F::R16G16B16A16_SFLOAT,
-
+            G::Xbgr2101010 => V::A2B10G10R10_UNORM_PACK32,
+            G::Abgr2101010 => V::A2B10G10R10_UNORM_PACK32,
+            G::Abgr16161616f => V::R16G16B16A16_SFLOAT,
+            
+            G::Xrgb2101010 => V::A2R10G10B10_UNORM_PACK32,
+            G::Argb2101010 => V::A2R10G10B10_UNORM_PACK32,
+            G::Argb16161616f => V::R16G16B16A16_SFLOAT,
+            
+            G::Rgb565 => V::R5G6B5_UNORM_PACK16,
             _ => panic!("unsupported color format"),
         }
     }

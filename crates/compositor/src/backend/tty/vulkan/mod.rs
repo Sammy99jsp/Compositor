@@ -177,6 +177,7 @@ impl Backend for Vulkan {
         drm: &DrmState,
         bo: gbm::BufferObject<()>,
     ) -> Result<Self::Buffer, Self::Error> {
+        let format: vk::Format = drmx::Format(bo.format()).into();
         // Create vk::Image
         let image = {
             let plane_layouts = (0..bo.plane_count())
@@ -198,7 +199,7 @@ impl Backend for Vulkan {
             let (width, height) = bo.size();
             let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
-                .format(drm.format.into())
+                .format(format)
                 .extent(vk::Extent3D {
                     width,
                     height,
@@ -281,7 +282,7 @@ impl Backend for Vulkan {
         let image_view = {
             let info = vk::ImageViewCreateInfo::default()
                 .components(vk::ComponentMapping::default())
-                .format(drm.format.into())
+                .format(format)
                 .image(*image)
                 .view_type(vk::ImageViewType::TYPE_2D)
                 .subresource_range(
@@ -300,10 +301,17 @@ impl Backend for Vulkan {
             })
         };
 
-        let skia = SkiaSurface::new(self, *image, *memory, alloc_size, drm.format, {
-            let (w, h) = drm.mode.size();
-            (w as u32, h as u32)
-        })?;
+        let skia = SkiaSurface::new(
+            self,
+            *image,
+            *memory,
+            alloc_size,
+            drmx::Format(bo.format()),
+            {
+                let (w, h) = drm.mode.size();
+                (w as u32, h as u32)
+            },
+        )?;
 
         Ok(VulkanBuffer {
             device: self.device.clone(),
@@ -541,7 +549,7 @@ impl SkiaSurface {
             &mut ctx,
             &target,
             skia_safe::gpu::SurfaceOrigin::TopLeft,
-            format.skia(),
+            format.try_into().unwrap(),
             None,
             None,
         )
